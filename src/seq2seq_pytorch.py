@@ -7,6 +7,7 @@ import torch.nn as nn
 from torch import optim
 from torch.nn.utils.clip_grad import clip_grad_value_
 
+from img_to_text import embedded_dropout
 from text_processing import tokenize_text, untokenize, pad_text, Toks
 
 cuda = True
@@ -64,7 +65,7 @@ def get_data(train=True, maxlines=-1, test_style=ROM_STYLE):
 
 
 class Encoder(nn.Module):
-    def __init__(self, input_size, hidden_size):
+    def __init__(self, input_size, hidden_size, words=None):
         super(Encoder, self).__init__()
         assert hidden_size % 2 == 0
 
@@ -74,16 +75,27 @@ class Encoder(nn.Module):
         self.hidden_init_tensor = torch.zeros(2, 1, self.hidden_size // 2, requires_grad=True)
         nn.init.normal_(self.hidden_init_tensor, mean=0, std=0.05)
         self.hidden_init = torch.nn.Parameter(self.hidden_init_tensor, requires_grad=True)
-
-        self.embedding = nn.Embedding(input_size, hidden_size)
+        weights_matrix = get_emb_weights_for_seq_to_seq(glove)
+        self.embedding, num_embeddings, embedding_dim = create_emb_layer(weights_matrix, True)
+        self.embedding.requires_grad = False
+        self.bn = nn.BatchNorm1d(20)
+        # self.embedding = nn.Embedding(input_size, hidden_size)
+        self.trans = nn.Linear(in_features=300, out_features=512)
         self.emb_drop = nn.Dropout(0.2)
+        # self.gru=RNNModel(rnn_type='GRU',ntoken=words, ninp=512,nhid=512/2,nlayers=1)
         self.gru = nn.GRU(hidden_size, hidden_size // 2, batch_first=True, bidirectional=True)
         self.gru_out_drop = nn.Dropout(0.2)
         self.gru_hid_drop = nn.Dropout(0.3)
 
     def forward(self, input, hidden, lengths):
-        emb = self.emb_drop(self.embedding(input))
-        pp = torch.nn.utils.rnn.pack_padded_sequence(emb, lengths, batch_first=True)
+        # emb = self.emb_drop(self.embedding(input))
+        # emb = self.embedding(input)
+
+        emb = embedded_dropout(self.embedding, input, dropout=0.2 if self.training else 0)
+        batch = self.trans(emb)
+        batch = self.bn(batch)
+        # pp = torch.nn.utils.rnn.pack_padded_sequence(emb, lengths, batch_first=True)
+        pp = torch.nn.utils.rnn.pack_padded_sequence(batch, lengths, batch_first=True)
         out, hidden = self.gru(pp, hidden)
         out = torch.nn.utils.rnn.pad_packed_sequence(out, batch_first=True)[0]
         out = self.gru_out_drop(out)
@@ -91,17 +103,22 @@ class Encoder(nn.Module):
         return out, hidden
 
     def initHidden(self, bs):
+        # return self.gru.init_hidden(bs)
         return self.hidden_init.expand(2, bs, self.hidden_size // 2).contiguous()
 
 
 class DecoderAttn(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, out_bias):
+    def __init__(self, input_size, hidden_size, output_size, out_bias, words=None):
         super(DecoderAttn, self).__init__()
         self.hidden_size = hidden_size
         self.input_size = input_size
-
-        self.embedding = nn.Embedding(input_size, hidden_size)
-        self.emb_drop = nn.Dropout(0.2)
+        self.trans = nn.Linear(in_features=300, out_features=512)
+        # self.emb_drop = nn.Dropout(0.2)
+        weights_matrix = get_emb_weights_for_seq_to_seq(glove)
+        self.embedding, num_embeddings, embedding_dim = create_emb_layer(weights_matrix, True)
+        self.embedding.requires_grad = False
+        # self.embedding = nn.Embedding(input_size, hidden_size)
+        # self.gru=RNNModel(rnn_type='GRU',ntoken=words, ninp=hidden_size,nhid=hidden_size,nlayers=1,bi=False)
         self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
         self.gru_drop = nn.Dropout(0.2)
         self.mlp = nn.Linear(hidden_size * 2, output_size)
@@ -109,13 +126,14 @@ class DecoderAttn(nn.Module):
             out_bias_tensor = torch.tensor(out_bias, requires_grad=False)
             self.mlp.bias.data[:] = out_bias_tensor
         self.logsoftmax = nn.LogSoftmax(dim=2)
-
         self.att_mlp = nn.Linear(hidden_size, hidden_size, bias=False)
         self.attn_softmax = nn.Softmax(dim=2)
 
     def forward(self, input, hidden, encoder_outs):
-        emb = self.embedding(input)
-        out, hidden = self.gru(self.emb_drop(emb), hidden)
+        emb = embedded_dropout(self.embedding, input, dropout=0.2 if self.training else 0)
+        # emb = self.embedding(input)
+        emb = self.trans(emb)
+        out, hidden = self.gru(emb, hidden)
 
         out_proj = self.att_mlp(out)
         enc_out_perm = encoder_outs.permute(0, 2, 1)
@@ -129,6 +147,13 @@ class DecoderAttn(nn.Module):
         out = self.mlp(full_ctx)
         out = self.logsoftmax(out)
         return out, hidden, attn
+
+
+def shuffle_padded(tensor, order):
+    for i in range(len(order) // 2):
+        temp = tensor[i]
+        tensor[i] = tensor[order[i]]
+        tensor[order[i]] = temp
 
 
 def build_model(enc_vocab_size, dec_vocab_size, dec_bias=None, hid_size=512, loaded_state=None):
@@ -202,6 +227,54 @@ def make_packpadded(s, e, enc_padded_text, dec_text_tensor=None):
         if cuda:
             leng.cuda(device=device)
         return order, new_enc, leng
+
+
+def extract_glove():
+    words = []
+    idx = 0
+    word2idx = {}
+    vectors = []
+    with open('glove.42B.300d.txt', 'r') as f:
+        for l in f:
+            line = l.split()
+            word = line[0]
+            words.append(word)
+            word2idx[word] = idx
+            idx += 1
+            vect = np.array([float(val) for val in line[1:]])
+            vectors.append(vect)
+        vectors = np.array(vectors)
+    glove = {w: vectors[word2idx[w]] for w in words}
+    return glove
+
+
+def get_emb_weights_for_seq_to_seq(glove):
+    input_text, input_rems_text = get_data(train=True)
+    dec_idx_to_word, dec_word_to_idx, dec_tok_text, dec_bias = tokenize_text(input_text, lower_case=True, vsize=20000)
+    target_words = dec_word_to_idx.keys()
+    matrix_len = len(target_words)
+    weights_matrix = np.zeros((matrix_len, 300))
+    words_found = 0
+
+    for i, word in enumerate(target_words):
+        try:
+            weights_matrix[i] = glove[word]
+            words_found += 1
+        except KeyError:
+            weights_matrix[i] = np.random.normal(scale=0.6, size=(300,))
+    return weights_matrix
+
+
+def create_emb_layer(weights_matrix, non_trainable=False):
+    weights_matrix = torch.from_numpy(weights_matrix)
+    num_embeddings, embedding_dim = weights_matrix.size()
+
+    emb_layer = nn.Embedding(num_embeddings, embedding_dim)
+    emb_layer.load_state_dict({'weight': weights_matrix})
+    if non_trainable:
+        emb_layer.weight.requires_grad = False
+
+    return emb_layer, num_embeddings, embedding_dim
 
 
 def save_state(enc, dec, enc_optim, dec_optim, dec_idx_to_word, dec_word_to_idx, enc_idx_to_word, enc_word_to_idx,
@@ -284,6 +357,8 @@ def train():
     enc_vocab_size = len(enc_idx_to_word)
 
     dec_text_tensor = torch.tensor(dec_padded_text, requires_grad=False)
+    order = np.arange(enc_padded_text.shape[0])
+    shuffle_padded(dec_text_tensor, order)
     if cuda:
         dec_text_tensor = dec_text_tensor.cuda(device=device)
 
@@ -360,4 +435,5 @@ def main():
 
 
 if __name__ == "__main__":
+    glove = extract_glove()
     main()

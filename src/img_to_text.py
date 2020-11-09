@@ -1,4 +1,3 @@
-import argparse
 import json
 import os
 import random
@@ -12,6 +11,7 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 from PIL import Image
 from torch import optim
+from torch.nn.utils import clip_grad_value_
 
 import seq2seq_pytorch as s2s
 from text_processing import tokenize_text, untokenize, pad_text
@@ -19,7 +19,7 @@ from text_processing import tokenize_text, untokenize, pad_text
 cuda = True
 device = 0
 
-coco_inception_features_path = "./data/coco_train_v3_pytorch.pik"
+coco_inception_features_path = "../data/coco_train_v3_pytorch.pik"
 coco_dataset_path = "./data/coco_dataset_full_rm_style.json"
 
 model_path = "./models/"
@@ -165,12 +165,12 @@ class ImgEmb(nn.Module):
         super(ImgEmb, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
-
+        self.emb_drop = nn.Dropout(0.2)
         self.mlp = nn.Linear(input_size, hidden_size)
-        self.relu = nn.ReLU()
+        self.tanh = nn.Tanh()
 
     def forward(self, input):
-        res = self.relu(self.mlp(input))
+        res = self.tanh(self.mlp(self.emb_drop(input)))
         return res
 
 
@@ -179,11 +179,10 @@ class Decoder(nn.Module):
         super(Decoder, self).__init__()
         self.hidden_size = hidden_size
         self.input_size = input_size
-
         self.embedding = nn.Embedding(input_size, hidden_size)
-        self.emb_drop = nn.Dropout(0.5)
+        self.emb_drop = nn.Dropout(0.2)
         self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
-        self.gru_drop = nn.Dropout(0.5)
+        self.gru_drop = nn.Dropout(0.2)
         self.mlp = nn.Linear(hidden_size, output_size)
         if out_bias is not None:
             out_bias_tensor = torch.tensor(out_bias, requires_grad=False)
@@ -192,10 +191,33 @@ class Decoder(nn.Module):
 
     def forward(self, input, hidden_in):
         emb = self.embedding(input)
-        out, hidden = self.gru(self.emb_drop(emb), hidden_in)
+        emb = self.emb_drop(emb)
+        out, hidden = self.gru(emb, hidden_in)
         out = self.mlp(self.gru_drop(out))
         out = self.logsoftmax(out)
         return out, hidden
+
+
+def embedded_dropout(embed, words, dropout=0.1, scale=None):
+    if dropout:
+        mask = embed.weight.data.new().resize_((embed.weight.size(0), 1)).bernoulli_(1 - dropout).expand_as(
+            embed.weight) / (1 - dropout)
+        masked_embed_weight = mask * embed.weight
+    else:
+        masked_embed_weight = embed.weight
+    if scale:
+        masked_embed_weight = scale.expand_as(masked_embed_weight) * masked_embed_weight
+
+    padding_idx = embed.padding_idx
+    if padding_idx is None:
+        padding_idx = -1
+
+    X = torch.nn.functional.embedding(words, masked_embed_weight,
+                                      padding_idx, embed.max_norm, embed.norm_type,
+                                      embed.scale_grad_by_freq,
+                                      embed.sparse
+                                      )
+    return X
 
 
 def build_model(dec_vocab_size, dec_bias=None, img_feat_size=2048,
@@ -214,8 +236,8 @@ def build_model(dec_vocab_size, dec_bias=None, img_feat_size=2048,
 def build_trainers(enc, dec, loaded_state=None):
     learning_rate = 0.001
     lossfunc = nn.NLLLoss(ignore_index=0)
-    enc_optim = optim.Adam(enc.parameters(), lr=learning_rate)
-    dec_optim = optim.Adam(dec.parameters(), lr=learning_rate)
+    enc_optim = optim.Adam(enc.parameters(), lr=learning_rate, weight_decay=1e-6)
+    dec_optim = optim.Adam(dec.parameters(), lr=learning_rate, weight_decay=1e-6)
     if loaded_state is not None:
         enc_optim.load_state_dict(load_state['enc_optim'])
         dec_optim.load_state_dict(load_state['dec_optim'])
@@ -356,7 +378,7 @@ def test(setup_data, test_folder=None, test_images=None):
 
 
 def train():
-    feats, filenames, sents = get_data(train=True)
+    feats, filenames, sents = get_image_data(train=True)
 
     dec_idx_to_word, dec_word_to_idx, dec_tok_text, dec_bias = tokenize_text(sents)
     dec_padded_text = pad_text(dec_tok_text)
@@ -371,12 +393,12 @@ def train():
         feats_tensor = feats_tensor.cuda(device=device)
         dec_text_tensor = dec_text_tensor.cuda(device=device)
 
-    num_batches = feats.shape[0] // BATCH_SIZE
+    num_batches = feats.shape[0] / BATCH_SIZE
 
     sm_loss = None
     enc.train()
     dec.train()
-    for epoch in range(0, 13):
+    for epoch in xrange(0, 13):
         print("Starting New Epoch: %d" % epoch)
 
         order = np.arange(feats.shape[0])
@@ -390,7 +412,7 @@ def train():
             feats_tensor = feats_tensor.cuda(device=device)
             dec_text_tensor = dec_text_tensor.cuda(device=device)
 
-        for i in range(num_batches):
+        for i in xrange(num_batches):
             s = i * BATCH_SIZE
             e = (i + 1) * BATCH_SIZE
 
@@ -409,6 +431,8 @@ def train():
                 sm_loss = sm_loss * 0.95 + 0.05 * loss.data
 
             loss.backward()
+            clip_grad_value_(dec_optim.param_groups[0]['params'], 5.0)
+
             enc_optim.step()
             dec_optim.step()
 
@@ -476,13 +500,15 @@ def main():
     # if args.cpu:
     #     cuda = False
     # if args.train:
-        train()
-    # elif args.test_server:
-    #     r = setup_test()
-    #     run_server(r)
-    # else:
-    #     r = setup_test()
-    #     test(r, args.test_folder)
+    train()
+
+
+# elif args.test_server:
+#     r = setup_test()
+#     run_server(r)
+# else:
+#     r = setup_test()
+#     test(r, args.test_folder)
 
 
 if __name__ == "__main__":
