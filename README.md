@@ -1,7 +1,7 @@
-##Styled and Diverse Image Captioning
+## Styled and Diverse Image Captioning
 
 
-
+A model for generating styled and diverse captions without needing to traing on styled or densly labeled dataset.
 
 
 
