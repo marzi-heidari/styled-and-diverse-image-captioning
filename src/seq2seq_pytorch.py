@@ -1,31 +1,35 @@
 import argparse
 import json
+import os
+import pickle
 
 import numpy as np
+import pkg_resources
 import torch
 import torch.nn as nn
+from symspellpy import SymSpell, Verbosity
 from torch import optim
 from torch.nn.utils.clip_grad import clip_grad_value_
+from tqdm import tqdm
 
-from img_to_text import embedded_dropout
 from text_processing import tokenize_text, untokenize, pad_text, Toks
 
 cuda = True
 device = 0
 
-rom_train_path = "./data/romance_wo_style.json"
-coco_train_path = "./data/coco_dataset_full_rm_style.json"
+rom_train_path = "../data/romance_wo_style.json"
+coco_train_path = "../data/coco_dataset_full_rm_style.json"
 
-model_path = "./models/"
-seq_to_seq_test_model_fname = "seq_to_txt_state.tar"
+model_path = "../models/"
+seq_to_seq_test_model_fname = f"seq_to_txt_state_{11}.tar"
 epoch_to_save_path = lambda epoch: model_path + "seq_to_txt_state_%d.tar" % int(epoch)
 
 BATCH_SIZE = 128
-ROM_STYLE = "ROMANCETOKEN"
-COCO_STYLE = "MSCOCOTOKEN"
+ROM_STYLE = "romancetoken"
+COCO_STYLE = "mscocotoken"
 
 
-def get_data(train=True, maxlines=-1, test_style=ROM_STYLE):
+def get_data(train=True, maxlines=-1, test_style=COCO_STYLE):
     input_text = []
     input_rems_text = []
 
@@ -38,7 +42,7 @@ def get_data(train=True, maxlines=-1, test_style=ROM_STYLE):
             rem_style = line[1]
             input_rems_text.append(rem_style + [ROM_STYLE])
             c += 1
-            if maxlines > 0 and c == maxlines:
+            if 0 < maxlines == c:
                 break
 
     c = 0
@@ -48,7 +52,7 @@ def get_data(train=True, maxlines=-1, test_style=ROM_STYLE):
             continue
         if (not train) and img["extrasplit"] == "train":
             continue
-        if maxlines > 0 and c == maxlines:
+        if 0 < maxlines == c:
             break
         for sen in img["sentences"]:
             if train:
@@ -56,12 +60,56 @@ def get_data(train=True, maxlines=-1, test_style=ROM_STYLE):
             else:
                 input_rems_text.append(sen["rm_style_tokens"] + [test_style])
             c += 1
-            if maxlines > 0 and c == maxlines:
+            if 0 < maxlines == c:
                 break
 
             input_text.append(sen["tokens"])
+    data_file = 'cleaned_input_rems_text_train.pkl' if train is True else 'cleaned_input_rems_text_test.pkl'
+    if os.path.exists(data_file):
+        with open(data_file, 'rb') as f:
+            input_rems_text = pickle.load(f)
+    else:
+        input_rems_text = clean_up_input(data_file, input_rems_text)
+    data_input_file = 'cleaned_input_text_train.pkl' if train is True else 'cleaned_input_text_test.pkl'
+    if os.path.exists(data_input_file):
+        with open(data_input_file, 'rb') as f:
+            input_text = pickle.load(f)
+    else:
+        input_text = clean_up_input(data_input_file, input_text)
 
     return input_text, input_rems_text
+
+
+def clean_up_input(data_file, input_rems_text):
+    m = []
+    sym_spell = SymSpell(max_dictionary_edit_distance=2, prefix_length=3)
+    dictionary_path = pkg_resources.resource_filename(
+        "symspellpy", "frequency_dictionary_en_82_765.txt")
+    # term_index is the column of the term and count_index is the
+    # column of the term frequency
+    sym_spell.load_dictionary(dictionary_path, term_index=0, count_index=1)
+    for i in tqdm(input_rems_text, position=0):
+        l = []
+        for j in range(len(i)):
+            t = correct_spell(
+                i[j].replace('NOUNNOUNNOUN', '').replace("PARTPARTPART", "").replace("FRAMENET", "").replace(
+                    "ADJADJADJ", "").replace('INTJINTJINTJ', '').lower(), sym_spell)
+            l.append(t)
+        m.append(l)
+    input_rems_text = m
+    with open(data_file, 'wb') as f:
+        pickle.dump(input_rems_text, f)
+    return input_rems_text
+
+
+def correct_spell(input_term, sym_spell):
+    # lookup suggestions for single-word input strings
+    # max edit distance per lookup
+    # (max_edit_distance_lookup <= max_dictionary_edit_distance)
+    suggestions = sym_spell.lookup(input_term, Verbosity.CLOSEST,
+                                   max_edit_distance=2)
+    # display suggestion term, term frequency, and edit distance
+    return suggestions[0].term if len(suggestions) > 0 else input_term
 
 
 class Encoder(nn.Module):
@@ -75,7 +123,8 @@ class Encoder(nn.Module):
         self.hidden_init_tensor = torch.zeros(2, 1, self.hidden_size // 2, requires_grad=True)
         nn.init.normal_(self.hidden_init_tensor, mean=0, std=0.05)
         self.hidden_init = torch.nn.Parameter(self.hidden_init_tensor, requires_grad=True)
-        weights_matrix = get_emb_weights_for_seq_to_seq(glove)
+        with open('weights_for_seq_to_seq.pkl', 'rb') as f:
+            weights_matrix = pickle.load(f)
         self.embedding, num_embeddings, embedding_dim = create_emb_layer(weights_matrix, True)
         self.embedding.requires_grad = False
         self.bn = nn.BatchNorm1d(20)
@@ -88,9 +137,8 @@ class Encoder(nn.Module):
         self.gru_hid_drop = nn.Dropout(0.3)
 
     def forward(self, input, hidden, lengths):
-        # emb = self.emb_drop(self.embedding(input))
+        #emb = self.emb_drop(self.embedding(input))
         # emb = self.embedding(input)
-
         emb = embedded_dropout(self.embedding, input, dropout=0.2 if self.training else 0)
         batch = self.trans(emb)
         batch = self.bn(batch)
@@ -107,17 +155,40 @@ class Encoder(nn.Module):
         return self.hidden_init.expand(2, bs, self.hidden_size // 2).contiguous()
 
 
+def embedded_dropout(embed, words, dropout=0.1, scale=None):
+    if dropout:
+        mask = embed.weight.data.new().resize_((embed.weight.size(0), 1)).bernoulli_(1 - dropout).expand_as(
+            embed.weight) / (1 - dropout)
+        masked_embed_weight = mask * embed.weight
+    else:
+        masked_embed_weight = embed.weight
+    if scale:
+        masked_embed_weight = scale.expand_as(masked_embed_weight) * masked_embed_weight
+
+    padding_idx = embed.padding_idx
+    if padding_idx is None:
+        padding_idx = -1
+
+    X = torch.nn.functional.embedding(words, masked_embed_weight,
+                                      padding_idx, embed.max_norm, embed.norm_type,
+                                      embed.scale_grad_by_freq,
+                                      embed.sparse
+                                      )
+    return X
+
+
 class DecoderAttn(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, out_bias, words=None):
         super(DecoderAttn, self).__init__()
         self.hidden_size = hidden_size
         self.input_size = input_size
         self.trans = nn.Linear(in_features=300, out_features=512)
-        # self.emb_drop = nn.Dropout(0.2)
-        weights_matrix = get_emb_weights_for_seq_to_seq(glove)
-        self.embedding, num_embeddings, embedding_dim = create_emb_layer(weights_matrix, True)
-        self.embedding.requires_grad = False
-        # self.embedding = nn.Embedding(input_size, hidden_size)
+        self.emb_drop = nn.Dropout(0.2)
+        # with open('weights_for_seq_to_seq_decoder.pkl', 'rb') as f:
+        #     weights_matrix = pickle.load(f)
+        # self.embedding, num_embeddings, embedding_dim = create_emb_layer(weights_matrix, True)
+        #self.embedding.requires_grad = False
+        self.embedding = nn.Embedding(input_size, 300)
         # self.gru=RNNModel(rnn_type='GRU',ntoken=words, ninp=hidden_size,nhid=hidden_size,nlayers=1,bi=False)
         self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
         self.gru_drop = nn.Dropout(0.2)
@@ -234,7 +305,7 @@ def extract_glove():
     idx = 0
     word2idx = {}
     vectors = []
-    with open('glove.42B.300d.txt', 'r') as f:
+    with open('../glove.42B.300d.txt', 'r') as f:
         for l in f:
             line = l.split()
             word = line[0]
@@ -248,10 +319,14 @@ def extract_glove():
     return glove
 
 
-def get_emb_weights_for_seq_to_seq(glove):
+def get_emb_weights_for_seq_to_seq(glove, encoder=True):
     input_text, input_rems_text = get_data(train=True)
-    dec_idx_to_word, dec_word_to_idx, dec_tok_text, dec_bias = tokenize_text(input_text, lower_case=True, vsize=20000)
-    target_words = dec_word_to_idx.keys()
+    if encoder:
+        enc_idx_to_word, word_to_idx, enc_tok_text, _ = tokenize_text(input_rems_text)
+    else:
+        dec_idx_to_word, word_to_idx, dec_tok_text, dec_bias = tokenize_text(input_text, lower_case=True,
+                                                                             vsize=20000)
+    target_words = word_to_idx.keys()
     matrix_len = len(target_words)
     weights_matrix = np.zeros((matrix_len, 300))
     words_found = 0
@@ -308,7 +383,7 @@ def setup_test():
             'dec_word_to_idx': dec_word_to_idx, 'dec_vocab_size': dec_vocab_size}
 
 
-def test(setup_data, input_seqs=None, test_style=ROM_STYLE):
+def test(setup_data, input_seqs=None, test_style=COCO_STYLE):
     if input_seqs is None:
         _, input_rems_text = get_data(train=False, test_style=test_style)
     else:
@@ -365,7 +440,7 @@ def train():
     enc, dec = build_model(enc_vocab_size, dec_vocab_size, dec_bias=dec_bias)
     enc_optim, dec_optim, lossfunc = build_trainers(enc, dec)
 
-    num_batches = enc_padded_text.shape[0] / BATCH_SIZE
+    num_batches = enc_padded_text.shape[0] // BATCH_SIZE
 
     sm_loss = None
     enc.train()
@@ -378,7 +453,7 @@ def train():
         enc_padded_text = enc_padded_text[order]
         dec_text_tensor.data = dec_text_tensor.data[order]
 
-        for i in range(num_batches):
+        for i in tqdm(range(num_batches)):
             s = i * BATCH_SIZE
             e = (i + 1) * BATCH_SIZE
 
@@ -435,5 +510,12 @@ def main():
 
 
 if __name__ == "__main__":
-    glove = extract_glove()
-    main()
+    train()
+    # glove = extract_glove()
+    # seq = get_emb_weights_for_seq_to_seq(glove)
+    # with open('weights_for_seq_to_seq.pkl', 'wb') as f:
+    #     pickle.dump(seq, f)
+    #
+    # seq = get_emb_weights_for_seq_to_seq(glove, encoder=False)
+    # with open('weights_for_seq_to_seq_decoder.pkl', 'wb') as f:
+    #     pickle.dump(seq, f)

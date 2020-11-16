@@ -4,25 +4,29 @@ import random
 import string
 
 import numpy as np
+import pandas
 import pickle5 as cPickle
+import pkg_resources
 import torch
 import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms as transforms
 from PIL import Image
+from symspellpy import SymSpell, Verbosity
 from torch import optim
 from torch.nn.utils import clip_grad_value_
+from tqdm import tqdm
 
 import seq2seq_pytorch as s2s
 from text_processing import tokenize_text, untokenize, pad_text
 
-cuda = True
+cuda = False
 device = 0
 
 coco_inception_features_path = "../data/coco_train_v3_pytorch.pik"
-coco_dataset_path = "./data/coco_dataset_full_rm_style.json"
+coco_dataset_path = "../data/coco_dataset_full_rm_style.json"
 
-model_path = "./models/"
+model_path = "../models/"
 test_model_fname = "img_to_txt_state.tar"
 epoch_to_save_path = lambda epoch: model_path + "img_to_txt_state_%d.tar" % int(epoch)
 
@@ -132,7 +136,9 @@ def get_image_reader(dirpath, transform, batch_size, workers=4):
 
 
 def get_data(train=True):
-    feats = cPickle.load(open(coco_inception_features_path, "rb"), encoding="latin1")
+    # feats = cPickle.load(open(coco_inception_features_path, "rb"), encoding="latin1")
+    feats = cPickle.load(open('../data/coco_train_v3.pik', "rb"), encoding="latin1")
+    feats.update(cPickle.load(open('../data/coco_val_ins.pik', "rb"), encoding="latin1"))
 
     sents = []
     final_feats = []
@@ -156,8 +162,41 @@ def get_data(train=True):
             filenames.append(img["filename"])
 
     final_feats = np.array(final_feats)
+    data_file = 'cleaned_sents_train.pkl' if train is True else 'cleaned_test_train.pkl'
+    if os.path.exists(data_file):
+        with open(data_file, 'rb') as f:
+            sents = cPickle.load(f)
+    else:
+        m = []
+        sym_spell = SymSpell(max_dictionary_edit_distance=2, prefix_length=3)
+        dictionary_path = pkg_resources.resource_filename(
+            "symspellpy", "frequency_dictionary_en_82_765.txt")
+        # term_index is the column of the term and count_index is the
+        # column of the term frequency
+        sym_spell.load_dictionary(dictionary_path, term_index=0, count_index=1)
+        for i in tqdm(sents, position=0):
+            l = []
+            for j in range(len(i)):
+                t = correct_spell(
+                    i[j].replace('NOUNNOUNNOUN', '').replace("PARTPARTPART", "").replace("FRAMENET", "").replace(
+                        "ADJADJADJ", "").replace('INTJINTJINTJ', '').lower(), sym_spell)
+                l.append(t)
+            m.append(l)
+        sents = m
 
+        with open(data_file, 'wb') as f:
+            cPickle.dump(sents, f)
     return final_feats, filenames, sents
+
+
+def correct_spell(input_term, sym_spell):
+    # lookup suggestions for single-word input strings
+    # max edit distance per lookup
+    # (max_edit_distance_lookup <= max_dictionary_edit_distance)
+    suggestions = sym_spell.lookup(input_term, Verbosity.CLOSEST,
+                                   max_edit_distance=2)
+    # display suggestion term, term frequency, and edit distance
+    return suggestions[0].term if len(suggestions) > 0 else input_term
 
 
 class ImgEmb(nn.Module):
@@ -196,28 +235,6 @@ class Decoder(nn.Module):
         out = self.mlp(self.gru_drop(out))
         out = self.logsoftmax(out)
         return out, hidden
-
-
-def embedded_dropout(embed, words, dropout=0.1, scale=None):
-    if dropout:
-        mask = embed.weight.data.new().resize_((embed.weight.size(0), 1)).bernoulli_(1 - dropout).expand_as(
-            embed.weight) / (1 - dropout)
-        masked_embed_weight = mask * embed.weight
-    else:
-        masked_embed_weight = embed.weight
-    if scale:
-        masked_embed_weight = scale.expand_as(masked_embed_weight) * masked_embed_weight
-
-    padding_idx = embed.padding_idx
-    if padding_idx is None:
-        padding_idx = -1
-
-    X = torch.nn.functional.embedding(words, masked_embed_weight,
-                                      padding_idx, embed.max_norm, embed.norm_type,
-                                      embed.scale_grad_by_freq,
-                                      embed.sparse
-                                      )
-    return X
 
 
 def build_model(dec_vocab_size, dec_bias=None, img_feat_size=2048,
@@ -320,8 +337,11 @@ def test(setup_data, test_folder=None, test_images=None):
     trans = setup_data['trans']
     loaded_state = setup_data['loaded_state']
     s2s_data = setup_data['s2s_data']
+    k = 0
 
     dec_vocab_size = len(loaded_state['dec_idx_to_word'])
+    id_captions = []
+    json_data = json.dumps(id_captions)
 
     if test_folder is not None:
         # load images from folder
@@ -365,20 +385,25 @@ def test(setup_data, test_folder=None, test_images=None):
         text = s2s.test(s2s_data, untok)
 
         for i in range(len(text)):
-            if using_images:
-                # text data is filenames
-                print("FN :", text_data[i])
-            else:
-                # text data is ground truth sentences
-                print("GT :", text_data[i])
-            print("DET:", ' '.join(untok[i]))
-            print("ROM:", text[i], "\n")
+            filenames[k] = filenames[k].replace('COCO_val2014_', '')
+            filenames[k] = filenames[k].replace('.jpg', '')
+            j = {"image_id": int(filenames[k]), "caption": text[i], "words": ' '.join(untok[i])}
+            id_captions.append(j)
+            k += 1
+
         all_text.extend(text)
+        with open('results/captions_val2014_' + test_model_fname + s2s.seq_to_seq_test_model_fname + '_results.json',
+                  'w') as outfile:
+            json.dump(id_captions, outfile)
+
+        pandas.DataFrame(id_captions).to_csv(
+            'results/captions_val2014_' + test_model_fname + s2s.seq_to_seq_test_model_fname + '_results.csv',
+            index=False)
     return all_text
 
 
 def train():
-    feats, filenames, sents = get_image_data(train=True)
+    feats, filenames, sents = get_data(train=True)
 
     dec_idx_to_word, dec_word_to_idx, dec_tok_text, dec_bias = tokenize_text(sents)
     dec_padded_text = pad_text(dec_tok_text)
@@ -393,12 +418,12 @@ def train():
         feats_tensor = feats_tensor.cuda(device=device)
         dec_text_tensor = dec_text_tensor.cuda(device=device)
 
-    num_batches = feats.shape[0] / BATCH_SIZE
+    num_batches = feats.shape[0] // BATCH_SIZE
 
     sm_loss = None
     enc.train()
     dec.train()
-    for epoch in xrange(0, 13):
+    for epoch in range(0, 13):
         print("Starting New Epoch: %d" % epoch)
 
         order = np.arange(feats.shape[0])
@@ -412,7 +437,7 @@ def train():
             feats_tensor = feats_tensor.cuda(device=device)
             dec_text_tensor = dec_text_tensor.cuda(device=device)
 
-        for i in xrange(num_batches):
+        for i in range(num_batches):
             s = i * BATCH_SIZE
             e = (i + 1) * BATCH_SIZE
 
@@ -468,7 +493,7 @@ def run_server(r):
             if len(files) > 100:
                 files = {}
             fn, ext = os.path.splitext(filename_raw)
-            filename = ''.join([random.choice(string.hexdigits) for v in xrange(20)]) + ext
+            filename = ''.join([random.choice(string.hexdigits) for v in range(20)]) + ext
             files[filename] = request.files['photo'].read()
             test_res = test(r, test_images=[request.files['photo']])
             # filename = photos.save(request.files['photo'])
@@ -499,8 +524,12 @@ def main():
     # global cuda
     # if args.cpu:
     #     cuda = False
-    # if args.train:
-    train()
+    global test_model_fname
+    for i in tqdm(range(13)):
+        test_model_fname = f'img_to_txt_state_{i}.tar'
+        te = setup_test()
+        test(setup_data=te)
+    # train()
 
 
 # elif args.test_server:
