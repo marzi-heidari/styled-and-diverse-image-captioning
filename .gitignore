@@ -3,6 +3,5 @@
 /figures/
 /test_data/
 /.idea/
-/.gitignore
-/coco-caption/
-/src/results/
+/results/
+/annotations/

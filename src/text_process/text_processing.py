@@ -2,6 +2,8 @@ from collections import Counter
 
 import numpy as np
 
+import torch
+
 
 class Toks:
     UNK = 3
@@ -13,6 +15,7 @@ class Toks:
 
 def tokenize_text(text, vsize=10000, res=Toks.TOTAL_RES, unk_idx=Toks.UNK, lower_case=False,
                   word_to_idx=None, idx_to_word=None):
+    # tokenizer = torch.hub.load('huggingface/pytorch-transformers', 'tokenizer', 'bert-base-uncased')
     tt = []
     tc = Counter()
     for line in text:

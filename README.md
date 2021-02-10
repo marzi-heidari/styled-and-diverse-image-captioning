@@ -3,7 +3,7 @@
 
 A model for generating styled and diverse captions without needing to traing on styled or densly labeled dataset.
 
-(tensorflow implementationcomming soon ...)
+(tensorflow implementation comming soon ...)
 
 
 ```

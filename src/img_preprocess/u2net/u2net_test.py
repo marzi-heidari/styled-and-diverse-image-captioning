@@ -79,13 +79,10 @@ def main():
     net.load_state_dict(torch.load(model_dir))
     # if torch.cuda.is_available():
     #     net.cuda()
-    print(net)
-    exit()
     net.eval()
     all_out = {}
     for i_test, data_test in tqdm(enumerate(test_salobj_dataloader)):
         sep_ = img_name_list[i_test].split(os.sep)[-1]
-
         inputs_test = data_test['image']
         inputs_test = inputs_test.type(torch.FloatTensor)
         #
@@ -93,13 +90,9 @@ def main():
         #     inputs_test = Variable(inputs_test.cuda())
         # else:
         inputs_test = Variable(inputs_test)
+        d = net(inputs_test)
 
-        d1, d2, d3, d4, d5, d6 = net(inputs_test)
-
-        # normalization
-        pred = [d]
-        print(pred.shape)
-        pred = normPRED(pred)
+        pred = normPRED(d)
         all_out[sep_] = pred
 
     pickle.dump(all_out, open("../data/coco_train_u2net.pik", "wb"), protocol=2)
