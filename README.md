@@ -1,7 +1,7 @@
 ## Styled and Diverse Image Captioning
 
 
-A model for generating styled and diverse captions without needing to traing on styled or densly labeled dataset.
+A model for generating styled and diverse captions without needing to traning on styled or densely labeled dataset.
 
 (tensorflow implementation comming soon ...)
 
