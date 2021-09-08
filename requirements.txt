@@ -36,7 +36,7 @@ opencv-python==4.4.0.46
 opt-einsum==3.3.0
 pandas==1.1.4
 pickle5==0.0.11
-Pillow==8.0.1
+Pillow==8.3.2
 protobuf==3.13.0
 pyasn1==0.4.8
 pyasn1-modules==0.2.8
