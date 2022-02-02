@@ -7,10 +7,14 @@ A model for generating styled and diverse captions without needing to traning on
 
 
 ```
-@misc{2007.03338,
-Author = {Marzieh Heidari and Mehdi Ghatee and Ahmad Nickabadi and Arash Pourhasan Nezhad},
-Title = {Diverse and Styled Image Captioning Using SVD-Based Mixture of Recurrent Experts},
-Year = {2020},
-Eprint = {arXiv:2007.03338},
+@article{https://doi.org/10.1002/cpe.6866,
+author = {Heidari, Marzi and Ghatee, Mehdi and Nickabadi, Ahmad and Pourhasan Nezhad, Arash},
+title = {Diverse and styled image captioning using singular value decomposition-based mixture of recurrent experts},
+journal = {Concurrency and Computation: Practice and Experience},
+pages = {e6866},
+keywords = {deep learning, image captioning, mixture of experts, singular value decomposition},
+doi = {https://doi.org/10.1002/cpe.6866},
+url = {https://onlinelibrary.wiley.com/doi/abs/10.1002/cpe.6866},
+eprint = {https://onlinelibrary.wiley.com/doi/pdf/10.1002/cpe.6866}
 }
 ```
